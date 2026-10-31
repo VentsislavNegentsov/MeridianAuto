@@ -4,6 +4,8 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Paint
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -14,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -24,6 +27,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -47,6 +52,7 @@ import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.location.LocationComponentActivationOptions
+import org.maplibre.android.location.OnCameraTrackingChangedListener
 import org.maplibre.android.location.modes.CameraMode
 import org.maplibre.android.location.modes.RenderMode
 import org.maplibre.android.maps.MapLibreMap
@@ -57,6 +63,7 @@ import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
 import org.maplibre.android.style.layers.PropertyFactory.*
+import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
@@ -68,33 +75,23 @@ import java.net.URLEncoder
 import kotlin.math.*
 
 /*
- * ---------------------------------------------------------------
- *  SETUP
- * ---------------------------------------------------------------
- *  build.gradle (app) dependencies:
- *    implementation("org.maplibre.gl:android-sdk:11.5.2")
- *    implementation(platform("androidx.compose:compose-bom:2024.09.00"))
- *    implementation("androidx.compose.material3:material3")
- *    implementation("androidx.compose.ui:ui")
- *    implementation("androidx.activity:activity-compose:1.9.2")
- *
- *  AndroidManifest.xml:
- *    <uses-permission android:name="android.permission.INTERNET"/>
- *    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
- *    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
- *
- *  Traffic layer: get a free key at developer.tomtom.com and paste below.
- *  Without a key the app still works, just without the traffic overlay.
- * ---------------------------------------------------------------
+ * OffTheGrid - Waze-style navigation on a satellite map.
+ * Dependencies / permissions: see the build files delivered with this project.
+ * Traffic layer: paste a free TomTom key below (developer.tomtom.com). Empty = no traffic overlay.
  */
-private const val TOMTOM_KEY = ""          // <- your TomTom API key (traffic flow tiles)
-private const val UA = "NaviDemo/1.0 (your@email.com)"   // required by Nominatim/Overpass policy
+private const val TOMTOM_KEY = ""
+private const val UA = "OffTheGrid/1.0 (your@email.com)"   // required by Nominatim/Overpass policy
+
+private val WBlue = Color(0xFF2D7FF9)
+private val WBlueDark = Color(0xFF1B5FCC)
+private val WGreen = Color(0xFF1E9E4A)
 
 // ------------------------------- DATA --------------------------------
 
-data class Step(val type: String, val mod: String, val name: String, val dist: Double, val lat: Double, val lon: Double)
+data class Step(val type: String, val mod: String, val name: String, val dist: Double,
+                val lat: Double, val lon: Double, val exit: Int = 0)
 data class RouteData(val points: List<DoubleArray>, val steps: List<Step>, val dist: Double, val dur: Double)
-data class Hazard(val type: String, val lat: Double, val lon: Double, val ts: Long = 0L)   // camera | police | hazard
+data class Hazard(val type: String, val lat: Double, val lon: Double, val ts: Long = 0L)  // camera|police|hazard|crash
 data class Place(val name: String, val lat: Double, val lon: Double)
 
 // ------------------------------ HELPERS ------------------------------
@@ -107,26 +104,41 @@ fun distM(aLat: Double, aLon: Double, bLat: Double, bLon: Double): Double {
     return 2 * r * asin(sqrt(h))
 }
 
-fun fmtDist(m: Double): String =
-    if (m < 1000) "${(m / 10).roundToInt() * 10} m" else "%.1f km".format(m / 1000)
+fun fmtDist(m: Double): String = when {
+    m < 100 -> "${(m / 10).roundToInt() * 10} m"
+    m < 1000 -> "${(m / 50).roundToInt() * 50} m"
+    else -> "%.1f km".format(m / 1000)
+}
 
 fun fmtDur(s: Double): String {
-    val min = (s / 60).roundToInt()
+    val min = max(1, (s / 60).roundToInt())
     return if (min < 60) "$min min" else "${min / 60} h ${min % 60} min"
 }
 
+fun arrivalTime(sec: Double): String =
+    java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+        .format(java.util.Date(System.currentTimeMillis() + (sec * 1000).toLong()))
+
+fun ordinal(n: Int) = when (n) { 1 -> "1st"; 2 -> "2nd"; 3 -> "3rd"; else -> "${n}th" }
+
+fun isRoundabout(t: String) = t == "roundabout" || t == "rotary" || t == "roundabout turn"
+
 fun instruction(s: Step): String {
     val road = if (s.name.isNotBlank()) " onto ${s.name}" else ""
-    return when (s.type) {
-        "arrive" -> "You have arrived"
-        "depart" -> "Head out$road"
-        "roundabout", "rotary" -> "Enter the roundabout"
-        else -> when {
-            s.mod == "uturn" -> "Make a U-turn$road"
-            s.mod.isBlank() || s.mod == "straight" -> "Continue$road"
-            s.mod.contains("slight") -> "Keep ${s.mod.removePrefix("slight ")}$road"
-            else -> "Turn ${s.mod}$road"
-        }
+    val side = if (s.mod.contains("left")) "left" else "right"
+    return when {
+        s.type == "arrive" -> "You have arrived"
+        s.type == "depart" -> "Head out$road"
+        isRoundabout(s.type) -> if (s.exit > 0) "Take the ${ordinal(s.exit)} exit$road" else "Enter the roundabout"
+        s.type == "exit roundabout" || s.type == "exit rotary" -> "Exit the roundabout$road"
+        s.type == "off ramp" -> "Take the exit on the $side$road"
+        s.type == "on ramp" -> "Take the ramp$road"
+        s.type == "fork" -> "Keep $side at the fork$road"
+        s.type == "merge" -> "Merge$road"
+        s.mod == "uturn" -> "Make a U-turn$road"
+        s.mod.isBlank() || s.mod == "straight" -> "Continue$road"
+        s.mod.contains("slight") -> "Keep ${s.mod.removePrefix("slight ")}$road"
+        else -> "Turn ${s.mod}$road"
     }
 }
 
@@ -146,7 +158,6 @@ suspend fun httpPost(url: String, body: String): String = withContext(Dispatcher
 
 // -------------------------- NETWORK SERVICES -------------------------
 
-/** Place search via OpenStreetMap Nominatim. */
 suspend fun searchPlaces(q: String): List<Place> {
     val j = JSONArray(httpGet("https://nominatim.openstreetmap.org/search?format=json&limit=6&q=" + URLEncoder.encode(q, "UTF-8")))
     return List(j.length()) {
@@ -155,7 +166,6 @@ suspend fun searchPlaces(q: String): List<Place> {
     }
 }
 
-/** Routing via OSRM demo server (OSM data). Swap for your own OSRM/Valhalla/GraphHopper in production. */
 suspend fun fetchRoute(aLat: Double, aLon: Double, bLat: Double, bLon: Double): RouteData? {
     val url = "https://router.project-osrm.org/route/v1/driving/$aLon,$aLat;$bLon,$bLat" +
             "?overview=full&geometries=geojson&steps=true"
@@ -166,12 +176,11 @@ suspend fun fetchRoute(aLat: Double, aLon: Double, bLat: Double, bLon: Double): 
     val steps = List(st.length()) {
         val s = st.getJSONObject(it); val m = s.getJSONObject("maneuver"); val l = m.getJSONArray("location")
         Step(m.getString("type"), m.optString("modifier", ""), s.optString("name", ""),
-            s.getDouble("distance"), l.getDouble(1), l.getDouble(0))
+            s.getDouble("distance"), l.getDouble(1), l.getDouble(0), m.optInt("exit", 0))
     }
     return RouteData(pts, steps, r.getDouble("distance"), r.getDouble("duration"))
 }
 
-/** Speed cameras from OpenStreetMap (highway=speed_camera) through Overpass. */
 suspend fun fetchCameras(s: Double, w: Double, n: Double, e: Double): List<Hazard> {
     val q = "[out:json][timeout:20];(node[\"highway\"=\"speed_camera\"]($s,$w,$n,$e););out;"
     val j = JSONObject(httpPost("https://overpass-api.de/api/interpreter", "data=" + URLEncoder.encode(q, "UTF-8")))
@@ -180,14 +189,13 @@ suspend fun fetchCameras(s: Double, w: Double, n: Double, e: Double): List<Hazar
 }
 
 // --------------------- LOCAL (USER) REPORTS STORE --------------------
-// Police/hazard reports are crowd-sourced in Waze. There is no public API for that,
-// so here they are stored on-device for 2 hours. To share them between users you need
-// a small backend (e.g. Firebase Firestore) - replace load/save with calls to it.
+// Waze reports are crowd-sourced through Waze's servers (no public API). Here they are kept
+// on-device for 2 hours. To share between users you need a backend (e.g. Firebase Firestore).
 
 private const val REPORT_TTL = 2 * 60 * 60 * 1000L
 
 fun loadReports(ctx: Context): List<Hazard> {
-    val raw = ctx.getSharedPreferences("navi", Context.MODE_PRIVATE).getString("reports", "[]") ?: "[]"
+    val raw = ctx.getSharedPreferences("offthegrid", Context.MODE_PRIVATE).getString("reports", "[]") ?: "[]"
     val a = JSONArray(raw); val now = System.currentTimeMillis()
     return List(a.length()) { a.getJSONObject(it) }
         .map { Hazard(it.getString("t"), it.getDouble("la"), it.getDouble("lo"), it.getLong("ts")) }
@@ -197,7 +205,7 @@ fun loadReports(ctx: Context): List<Hazard> {
 fun saveReports(ctx: Context, list: List<Hazard>) {
     val a = JSONArray()
     list.forEach { a.put(JSONObject().put("t", it.type).put("la", it.lat).put("lo", it.lon).put("ts", it.ts)) }
-    ctx.getSharedPreferences("navi", Context.MODE_PRIVATE).edit().putString("reports", a.toString()).apply()
+    ctx.getSharedPreferences("offthegrid", Context.MODE_PRIVATE).edit().putString("reports", a.toString()).apply()
 }
 
 // ----------------------------- MAP STYLE -----------------------------
@@ -223,6 +231,19 @@ fun styleJson(): String {
       {"id":"roads","type":"raster","source":"roads"},
       {"id":"places","type":"raster","source":"places"}]}
     """.trimIndent()
+}
+
+/** Round map badge (emoji on coloured circle with white ring), like Waze report pins. */
+fun badge(emoji: String, bg: Int): Bitmap {
+    val s = 96
+    val bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+    val c = android.graphics.Canvas(bmp)
+    val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    p.color = android.graphics.Color.WHITE; c.drawCircle(s / 2f, s / 2f, s / 2f, p)
+    p.color = bg; c.drawCircle(s / 2f, s / 2f, s / 2f - 6f, p)
+    p.textSize = 50f; p.textAlign = Paint.Align.CENTER
+    c.drawText(emoji, s / 2f, s / 2f - (p.descent() + p.ascent()) / 2f, p)
+    return bmp
 }
 
 // ----------------------------- ACTIVITY ------------------------------
@@ -265,9 +286,11 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
     var route by remember { mutableStateOf<RouteData?>(null) }
     var navigating by remember { mutableStateOf(false) }
     var stepIdx by remember { mutableIntStateOf(0) }
+    var progressIdx by remember { mutableIntStateOf(0) }
     var remDist by remember { mutableDoubleStateOf(0.0) }
     var distToNext by remember { mutableDoubleStateOf(0.0) }
     var rerouting by remember { mutableStateOf(false) }
+    var following by remember { mutableStateOf(true) }
     var msg by remember { mutableStateOf<String?>(null) }
     var cameras by remember { mutableStateOf<List<Hazard>>(emptyList()) }
     var reports by remember { mutableStateOf(loadReports(ctx)) }
@@ -281,7 +304,6 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         if (!hasPerm) permLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
     }
 
-    // ---- own GPS listener (drives navigation logic) ----
     DisposableEffect(hasPerm) {
         val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
         val l = LocationListener { myLoc = it }
@@ -300,35 +322,46 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         scope.launch {
             val r = runCatching { fetchRoute(me.latitude, me.longitude, p.lat, p.lon) }.getOrNull()
             if (r == null) { msg = "No route found"; return@launch }
-            route = r; stepIdx = 0; msg = null
-            remDist = r.dist; distToNext = r.steps.getOrNull(1)?.let { distM(me.latitude, me.longitude, it.lat, it.lon) } ?: 0.0
+            route = r; stepIdx = 0; progressIdx = 0; msg = null
+            remDist = r.dist
+            distToNext = r.steps.getOrNull(1)?.let { distM(me.latitude, me.longitude, it.lat, it.lon) } ?: 0.0
             val pts = r.points.map { LatLng(it[1], it[0]) }
-            map?.easeCamera(CameraUpdateFactory.newLatLngBounds(LatLngBounds.fromLatLngs(pts), 160), 800)
+            map?.easeCamera(CameraUpdateFactory.newLatLngBounds(LatLngBounds.fromLatLngs(pts), 200), 800)
         }
     }
 
-    fun cancelRoute() { navigating = false; route = null; dest = null; stepIdx = 0 }
+    fun cancelRoute() { navigating = false; route = null; dest = null; stepIdx = 0; progressIdx = 0; following = true }
 
-    // ---- map layers setup ----
+    fun report(type: String) {
+        val l = myLoc
+        if (l != null) {
+            reports = reports + Hazard(type, l.latitude, l.longitude, System.currentTimeMillis())
+            saveReports(ctx, reports); msg = "Thanks for reporting!"
+        } else msg = "No GPS fix yet"
+        reportMenu = false
+    }
+
+    // ---- map layers ----
     LaunchedEffect(style) {
         val st = style ?: return@LaunchedEffect
         st.addSource(GeoJsonSource("route"))
         st.addLayer(LineLayer("route-casing", "route").withProperties(
-            lineColor("#FFFFFF"), lineWidth(11f), lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND)))
+            lineColor("#FFFFFF"), lineWidth(12f), lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND)))
         st.addLayer(LineLayer("route-line", "route").withProperties(
-            lineColor("#1A73E8"), lineWidth(7f), lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND)))
+            lineColor("#2D7FF9"), lineWidth(8f), lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND)))
+        st.addImage("camera", badge("📷", 0xFFFF6D00.toInt()))
+        st.addImage("police", badge("🚓", 0xFF1565C0.toInt()))
+        st.addImage("hazard", badge("⚠️", 0xFFF9A825.toInt()))
+        st.addImage("crash", badge("💥", 0xFFD32F2F.toInt()))
         st.addSource(GeoJsonSource("hazards"))
-        st.addLayer(CircleLayer("hazards-layer", "hazards").withProperties(
-            circleRadius(9f), circleStrokeColor("#FFFFFF"), circleStrokeWidth(2.5f),
-            circleColor(Expression.match(Expression.get("type"), Expression.color(0xFFFBC02D.toInt()),
-                Expression.stop("camera", Expression.color(0xFFFF6D00.toInt())),
-                Expression.stop("police", Expression.color(0xFF1565C0.toInt()))))))
+        st.addLayer(SymbolLayer("hazards-layer", "hazards").withProperties(
+            iconImage(Expression.get("type")), iconAllowOverlap(true), iconIgnorePlacement(true), iconSize(0.6f)))
         st.addSource(GeoJsonSource("dest"))
         st.addLayer(CircleLayer("dest-layer", "dest").withProperties(
             circleRadius(10f), circleColor("#D32F2F"), circleStrokeColor("#FFFFFF"), circleStrokeWidth(3f)))
     }
 
-    // ---- location puck + camera mode ----
+    // ---- location arrow + camera mode ----
     LaunchedEffect(hasPerm, style, route, navigating) {
         val st = style ?: return@LaunchedEffect
         val m = map ?: return@LaunchedEffect
@@ -336,24 +369,29 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         val lc = m.locationComponent
         if (!lc.isLocationComponentActivated) {
             lc.activateLocationComponent(LocationComponentActivationOptions.builder(ctx, st).useDefaultLocationEngine(true).build())
+            lc.addOnCameraTrackingChangedListener(object : OnCameraTrackingChangedListener {
+                override fun onCameraTrackingDismissed() { following = false }
+                override fun onCameraTrackingChanged(currentMode: Int) { following = currentMode != CameraMode.NONE }
+            })
         }
         lc.isLocationComponentEnabled = true
-        lc.renderMode = RenderMode.GPS                       // standard navigation arrow puck
+        lc.renderMode = RenderMode.GPS
         lc.cameraMode = when {
-            navigating -> CameraMode.TRACKING_GPS            // follow + rotate with heading
-            route != null -> CameraMode.NONE                 // route overview
+            navigating -> CameraMode.TRACKING_GPS
+            route != null -> CameraMode.NONE
             else -> CameraMode.TRACKING
         }
         lc.zoomWhileTracking(if (navigating) 17.0 else 15.0)
         lc.tiltWhileTracking(if (navigating) 50.0 else 0.0)
     }
 
-    // ---- push data to map ----
-    LaunchedEffect(style, route) {
+    // ---- push data to map (only the remaining part of the route while driving) ----
+    LaunchedEffect(style, route, progressIdx, navigating) {
         val st = style ?: return@LaunchedEffect
-        val fc = route?.let { r ->
-            FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(r.points.map { Point.fromLngLat(it[0], it[1]) })))
-        } ?: FeatureCollection.fromFeatures(emptyList<Feature>())
+        val pts = route?.points?.let { if (navigating) it.drop(progressIdx) else it }
+        val fc = if (pts != null && pts.size > 1)
+            FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(pts.map { Point.fromLngLat(it[0], it[1]) })))
+        else FeatureCollection.fromFeatures(emptyList<Feature>())
         st.getSourceAs<GeoJsonSource>("route")?.setGeoJson(fc)
     }
     LaunchedEffect(style, dest) {
@@ -370,7 +408,7 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         st.getSourceAs<GeoJsonSource>("hazards")?.setGeoJson(FeatureCollection.fromFeatures(feats))
     }
 
-    // ---- load speed cameras: around first fix, then around each route ----
+    // ---- speed cameras from OSM ----
     LaunchedEffect(myLoc != null) {
         val me = myLoc ?: return@LaunchedEffect
         if (camsLoaded) return@LaunchedEffect
@@ -398,22 +436,34 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
             stepIdx++
         }
         remDist = distToNext + r.steps.drop(stepIdx + 1).sumOf { it.dist }
-        val off = r.points.minOf { distM(l.latitude, l.longitude, it[1], it[0]) }
-        if (off > 70 && !rerouting) {
+        var best = Double.MAX_VALUE; var bi = 0
+        r.points.forEachIndexed { i, pt ->
+            val d = distM(l.latitude, l.longitude, pt[1], pt[0])
+            if (d < best) { best = d; bi = i }
+        }
+        progressIdx = bi
+        if (best > 70 && !rerouting) {
             val d = dest ?: return@LaunchedEffect
-            rerouting = true; msg = "Rerouting..."
+            rerouting = true; msg = "Recalculating..."
             val nr = runCatching { fetchRoute(l.latitude, l.longitude, d.lat, d.lon) }.getOrNull()
-            if (nr != null) { route = nr; stepIdx = 0 }
+            if (nr != null) { route = nr; stepIdx = 0; progressIdx = 0 }
             msg = null; rerouting = false
         }
     }
 
-    // ---- nearest hazard warning (<500 m) ----
+    LaunchedEffect(msg) {
+        if (msg != null && msg != "Recalculating..." && msg != "Calculating route...") {
+            kotlinx.coroutines.delay(2500); msg = null
+        }
+    }
+
     val warning = remember(myLoc, cameras, reports) {
         val l = myLoc ?: return@remember null
         (cameras + reports).map { it to distM(l.latitude, l.longitude, it.lat, it.lon) }
             .filter { it.second < 500 }.minByOrNull { it.second }
     }
+    val kmh = ((myLoc?.speed ?: 0f) * 3.6f).roundToInt()
+    val bottomPad = if (route != null) 118.dp else 24.dp
 
     // ================================ LAYOUT ================================
     Box(Modifier.fillMaxSize()) {
@@ -424,40 +474,54 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
                 onMapView(mv)
                 mv.getMapAsync { m ->
                     map = m
-                    m.uiSettings.isCompassEnabled = true
+                    m.uiSettings.isCompassEnabled = false
+                    m.uiSettings.isLogoEnabled = false
                     m.setStyle(Style.Builder().fromJson(styleJson())) { style = it }
                     m.cameraPosition = CameraPosition.Builder().target(LatLng(42.6977, 23.3219)).zoom(11.0).build()
-                    // long-press anywhere to set a destination
                     m.addOnMapLongClickListener { ll -> startRoute(Place("Dropped pin", ll.latitude, ll.longitude)); true }
                 }
             }
         })
 
-        // ---------- TOP: search or turn banner ----------
+        // ---------- TOP ----------
         Column(Modifier.align(Alignment.TopCenter).fillMaxWidth().statusBarsPadding().padding(10.dp)) {
             val r = route
             if (navigating && r != null) {
                 val s = r.steps.getOrNull(stepIdx + 1)
                 if (s != null) {
                     Row(
-                        Modifier.fillMaxWidth().background(Color(0xFF1B5E20), RoundedCornerShape(16.dp)).padding(14.dp),
+                        Modifier.fillMaxWidth().shadow(8.dp, RoundedCornerShape(20.dp))
+                            .background(WBlue, RoundedCornerShape(20.dp)).padding(horizontal = 16.dp, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        ManeuverArrow(s.type, s.mod, Color.White, 64.dp)
+                        ManeuverArrow(s.type, s.mod, s.exit, Color.White, 76.dp)
                         Spacer(Modifier.width(14.dp))
                         Column {
-                            Text(fmtDist(distToNext), color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-                            Text(instruction(s), color = Color.White, fontSize = 16.sp)
+                            Text(fmtDist(distToNext), color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold)
+                            Text(instruction(s), color = Color.White, fontSize = 17.sp, maxLines = 2)
+                        }
+                    }
+                    val t = r.steps.getOrNull(stepIdx + 2)
+                    if (t != null && s.dist < 400) {
+                        Row(
+                            Modifier.padding(top = 6.dp).background(WBlueDark, RoundedCornerShape(16.dp))
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Then", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                            Spacer(Modifier.width(8.dp))
+                            ManeuverArrow(t.type, t.mod, t.exit, Color.White, 30.dp)
                         }
                     }
                 }
-            } else {
-                Surface(shape = RoundedCornerShape(28.dp), shadowElevation = 6.dp) {
+            } else if (route == null) {
+                Surface(shape = RoundedCornerShape(30.dp), shadowElevation = 8.dp) {
                     OutlinedTextField(
                         value = query, onValueChange = { query = it },
                         modifier = Modifier.fillMaxWidth(), singleLine = true,
-                        placeholder = { Text("Where to?") },
-                        shape = RoundedCornerShape(28.dp),
+                        placeholder = { Text("Where to?", fontSize = 17.sp) },
+                        leadingIcon = { Text("🔍", fontSize = 18.sp) },
+                        shape = RoundedCornerShape(30.dp),
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                         keyboardActions = KeyboardActions(onSearch = {
                             scope.launch { results = runCatching { searchPlaces(query) }.getOrDefault(emptyList()) }
@@ -468,11 +532,13 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
                     )
                 }
                 if (results.isNotEmpty()) {
-                    Surface(Modifier.padding(top = 6.dp), shape = RoundedCornerShape(16.dp), shadowElevation = 6.dp) {
+                    Surface(Modifier.padding(top = 6.dp), shape = RoundedCornerShape(18.dp), shadowElevation = 8.dp) {
                         Column {
                             results.forEach { p ->
-                                Text(p.name, maxLines = 2, modifier = Modifier.fillMaxWidth()
-                                    .clickable { startRoute(p) }.padding(14.dp), fontSize = 14.sp)
+                                Row(Modifier.fillMaxWidth().clickable { startRoute(p) }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Text("📍", fontSize = 18.sp); Spacer(Modifier.width(10.dp))
+                                    Text(p.name, maxLines = 2, fontSize = 14.sp)
+                                }
                                 HorizontalDivider()
                             }
                         }
@@ -481,72 +547,113 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
             }
 
             warning?.let { (h, d) ->
-                val label = when (h.type) { "camera" -> "Speed camera"; "police" -> "Police reported"; else -> "Hazard" }
-                val col = when (h.type) { "camera" -> Color(0xFFFF6D00); "police" -> Color(0xFF1565C0); else -> Color(0xFFF9A825) }
-                Text("⚠ $label ahead · ${fmtDist(d)}", color = Color.White, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(top = 8.dp).background(col, RoundedCornerShape(12.dp)).padding(horizontal = 14.dp, vertical = 8.dp))
+                val (label, col) = when (h.type) {
+                    "camera" -> "Speed camera" to Color(0xFFFF6D00)
+                    "police" -> "Police" to Color(0xFF1565C0)
+                    "crash" -> "Crash" to Color(0xFFD32F2F)
+                    else -> "Hazard" to Color(0xFFF9A825)
+                }
+                Text("$label ahead · ${fmtDist(d)}", color = Color.White, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 8.dp).background(col, RoundedCornerShape(14.dp)).padding(horizontal = 14.dp, vertical = 8.dp))
             }
             msg?.let {
                 Text(it, color = Color.White, modifier = Modifier.padding(top = 8.dp)
-                    .background(Color(0xCC000000), RoundedCornerShape(12.dp)).padding(horizontal = 14.dp, vertical = 8.dp))
+                    .background(Color(0xCC000000), RoundedCornerShape(14.dp)).padding(horizontal = 14.dp, vertical = 8.dp))
             }
         }
 
-        // ---------- RIGHT: report button ----------
-        Column(Modifier.align(Alignment.CenterEnd).padding(12.dp), horizontalAlignment = Alignment.End,
-            verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            if (reportMenu) {
-                listOf("police" to "🚓 Police", "hazard" to "⚠ Hazard", "camera" to "📷 Camera").forEach { (type, label) ->
-                    ExtendedFloatingActionButton(onClick = {
-                        val l = myLoc
-                        if (l != null) {
-                            reports = reports + Hazard(type, l.latitude, l.longitude, System.currentTimeMillis())
-                            saveReports(ctx, reports); msg = "Reported — thanks!"
-                        } else msg = "No GPS fix yet"
-                        reportMenu = false
-                    }) { Text(label) }
+        // ---------- SPEED BUBBLE ----------
+        if (hasPerm && myLoc != null) {
+            Box(
+                Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = bottomPad + 8.dp)
+                    .size(66.dp).shadow(8.dp, CircleShape).background(Color.White, CircleShape)
+                    .border(3.dp, Color(0xFFBDBDBD), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("$kmh", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color(0xFF263238))
+                    Text("km/h", fontSize = 9.sp, color = Color.Gray)
                 }
             }
-            FloatingActionButton(onClick = { reportMenu = !reportMenu }, containerColor = Color(0xFFFFC107)) {
-                Text(if (reportMenu) "✕" else "!", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        }
+
+        // ---------- RIGHT BUTTONS ----------
+        Column(Modifier.align(Alignment.BottomEnd).padding(end = 12.dp, bottom = bottomPad + 8.dp),
+            horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (navigating && !following) {
+                Row(Modifier.shadow(8.dp, RoundedCornerShape(26.dp)).background(WBlue, RoundedCornerShape(26.dp))
+                    .clickable {
+                        map?.locationComponent?.cameraMode = CameraMode.TRACKING_GPS; following = true
+                    }.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                    Text("➤ Re-center", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            }
+            RoundBtn(if (reportMenu) "✕" else "📢") { reportMenu = !reportMenu }
+        }
+
+        // ---------- REPORT SHEET ----------
+        if (reportMenu) {
+            Surface(Modifier.align(Alignment.BottomCenter).padding(bottom = bottomPad + 84.dp, start = 12.dp, end = 12.dp).fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp), shadowElevation = 14.dp) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Report", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Spacer(Modifier.height(10.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                        ReportTile("🚓", "Police") { report("police") }
+                        ReportTile("⚠️", "Hazard") { report("hazard") }
+                        ReportTile("📷", "Camera") { report("camera") }
+                        ReportTile("💥", "Crash") { report("crash") }
+                    }
+                }
             }
         }
 
-        // ---------- BOTTOM: route panel ----------
+        // ---------- BOTTOM ----------
         route?.let { r ->
-            Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(), shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp), shadowElevation = 12.dp) {
-                Row(Modifier.navigationBarsPadding().padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp), shadowElevation = 16.dp) {
+                val dist = if (navigating) remDist else r.dist
+                val dur = if (navigating && r.dist > 0) r.dur * remDist / r.dist else r.dur
+                Row(Modifier.navigationBarsPadding().padding(horizontal = 16.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (navigating) {
+                        RoundBtn("✕", bg = Color(0xFFEEEEEE), size = 48.dp) { cancelRoute() }
+                        Spacer(Modifier.width(14.dp))
+                    }
                     Column(Modifier.weight(1f)) {
-                        val dist = if (navigating) remDist else r.dist
-                        val dur = if (navigating && r.dist > 0) r.dur * remDist / r.dist else r.dur
-                        Text(fmtDur(dur), fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1B5E20))
-                        Text("${fmtDist(dist)}  ·  ${dest?.name?.take(40) ?: ""}", fontSize = 13.sp, maxLines = 1)
+                        Text(fmtDur(dur), fontSize = 26.sp, fontWeight = FontWeight.Bold, color = WGreen)
+                        Text("${fmtDist(dist)}  ·  ${arrivalTime(dur)}" + if (!navigating) "  ·  ${dest?.name?.take(24) ?: ""}" else "",
+                            fontSize = 13.sp, color = Color.Gray, maxLines = 1)
                     }
                     if (!navigating) {
-                        OutlinedButton(onClick = { cancelRoute() }) { Text("Cancel") }
-                        Spacer(Modifier.width(8.dp))
-                        Button(onClick = { navigating = true; stepIdx = 0 }) { Text("Start") }
-                    } else {
-                        Button(onClick = { cancelRoute() }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))) { Text("Exit") }
+                        TextButton(onClick = { cancelRoute() }) { Text("Cancel") }
+                        Spacer(Modifier.width(6.dp))
+                        Button(onClick = { navigating = true; stepIdx = 0; progressIdx = 0 },
+                            colors = ButtonDefaults.buttonColors(containerColor = WBlue),
+                            shape = RoundedCornerShape(26.dp), modifier = Modifier.height(52.dp)) {
+                            Text("Go", fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 14.dp))
+                        }
                     }
                 }
             }
-        }
-
-        // ---------- LEGEND ----------
-        Row(Modifier.align(Alignment.BottomStart).padding(start = 10.dp, bottom = if (route != null) 110.dp else 14.dp)
-            .background(Color(0xAA000000), RoundedCornerShape(10.dp)).padding(8.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Dot(Color(0xFFFF6D00), "Camera"); Dot(Color(0xFF1565C0), "Police"); Dot(Color(0xFFFBC02D), "Hazard")
         }
     }
 }
 
 @Composable
-fun Dot(c: Color, label: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.size(10.dp).background(c, CircleShape)); Spacer(Modifier.width(4.dp))
-        Text(label, color = Color.White, fontSize = 11.sp)
+fun RoundBtn(label: String, bg: Color = Color.White, size: Dp = 56.dp, onClick: () -> Unit) {
+    Box(Modifier.size(size).shadow(8.dp, CircleShape).clip(CircleShape).background(bg).clickable { onClick() },
+        contentAlignment = Alignment.Center) { Text(label, fontSize = 22.sp) }
+}
+
+@Composable
+fun ReportTile(emoji: String, label: String, onClick: () -> Unit) {
+    Column(Modifier.clip(RoundedCornerShape(16.dp)).clickable { onClick() }.padding(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(Modifier.size(58.dp).background(Color(0xFFF1F3F4), CircleShape), contentAlignment = Alignment.Center) {
+            Text(emoji, fontSize = 28.sp)
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(label, fontSize = 12.sp)
     }
 }
 
@@ -559,17 +666,44 @@ fun turnAngle(mod: String): Double = Math.toRadians(when (mod) {
 })
 
 @Composable
-fun ManeuverArrow(type: String, mod: String, color: Color = Color.White, size: Dp = 64.dp) {
+fun ManeuverArrow(type: String, mod: String, exit: Int = 0, color: Color = Color.White, size: Dp = 64.dp) {
     Canvas(Modifier.size(size)) {
         val w = this.size.width
         fun p(x: Float, y: Float) = Offset(x * w, y * w)
-        val stroke = Stroke(width = w * 0.12f, cap = StrokeCap.Round)
+        val sw = w * 0.11f
 
-        if (type == "arrive") {                       // destination marker
-            drawCircle(color, radius = w * 0.28f, center = p(.5f, .5f), style = stroke)
+        fun head(prev: Offset, e: Offset) {
+            val dx = e.x - prev.x; val dy = e.y - prev.y; val len = hypot(dx, dy)
+            if (len == 0f) return
+            val ux = dx / len; val uy = dy / len
+            for (deg in listOf(150.0, -150.0)) {
+                val t = Math.toRadians(deg)
+                val rx = (ux * cos(t) - uy * sin(t)).toFloat(); val ry = (ux * sin(t) + uy * cos(t)).toFloat()
+                drawLine(color, e, Offset(e.x + rx * w * 0.24f, e.y + ry * w * 0.24f), strokeWidth = sw, cap = StrokeCap.Round)
+            }
+        }
+
+        if (type == "arrive") {
+            drawCircle(color, radius = w * 0.28f, center = p(.5f, .5f), style = Stroke(width = sw))
             drawCircle(color, radius = w * 0.10f, center = p(.5f, .5f))
             return@Canvas
         }
+
+        if (isRoundabout(type)) {
+            val c = p(.5f, .56f); val rad = w * 0.17f
+            drawCircle(color, radius = rad, center = c, style = Stroke(width = sw * 0.8f))
+            drawLine(color, p(.5f, .95f), Offset(c.x, c.y + rad), strokeWidth = sw, cap = StrokeCap.Round)
+            val a = if (mod.isNotBlank()) turnAngle(mod) else when (exit) {
+                1 -> Math.toRadians(90.0); 2 -> 0.0; 3 -> Math.toRadians(-90.0); else -> Math.toRadians(180.0)
+            }
+            val dirX = sin(a).toFloat(); val dirY = -cos(a).toFloat()
+            val start = Offset(c.x + dirX * rad, c.y + dirY * rad)
+            val end = Offset(c.x + dirX * (rad + w * 0.30f), c.y + dirY * (rad + w * 0.30f))
+            drawLine(color, start, end, strokeWidth = sw, cap = StrokeCap.Round)
+            head(start, end)
+            return@Canvas
+        }
+
         val pts: List<Offset> = if (mod == "uturn") {
             listOf(p(.68f, .88f), p(.68f, .35f), p(.5f, .16f), p(.32f, .35f), p(.32f, .62f))
         } else {
@@ -580,16 +714,7 @@ fun ManeuverArrow(type: String, mod: String, color: Color = Color.White, size: D
                 listOf(p(.5f, .88f), c, Offset(c.x + (0.38 * w * sin(a)).toFloat(), c.y - (0.38 * w * cos(a)).toFloat()))
             }
         }
-        for (i in 0 until pts.size - 1) drawLine(color, pts[i], pts[i + 1], strokeWidth = stroke.width, cap = StrokeCap.Round)
-
-        // arrow head
-        val e = pts.last(); val pr = pts[pts.size - 2]
-        val dx = e.x - pr.x; val dy = e.y - pr.y; val len = hypot(dx, dy)
-        val ux = dx / len; val uy = dy / len
-        for (deg in listOf(150.0, -150.0)) {
-            val t = Math.toRadians(deg)
-            val rx = (ux * cos(t) - uy * sin(t)).toFloat(); val ry = (ux * sin(t) + uy * cos(t)).toFloat()
-            drawLine(color, e, Offset(e.x + rx * w * 0.24f, e.y + ry * w * 0.24f), strokeWidth = stroke.width, cap = StrokeCap.Round)
-        }
+        for (i in 0 until pts.size - 1) drawLine(color, pts[i], pts[i + 1], strokeWidth = sw, cap = StrokeCap.Round)
+        head(pts[pts.size - 2], pts.last())
     }
 }
