@@ -1,5 +1,4 @@
 package com.offthegrid
-
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -18,6 +17,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,11 +29,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.Dp
@@ -42,6 +45,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -74,32 +78,27 @@ import java.net.URL
 import java.net.URLEncoder
 import kotlin.math.*
 
-/*
- * OffTheGrid - Waze-style navigation on a satellite map.
- * Dependencies / permissions: see the build files delivered with this project.
- * Traffic layer: paste a free TomTom key below (developer.tomtom.com). Empty = no traffic overlay.
- */
+/* OffTheGrid - Waze-style navigation on a satellite map.
+   Traffic overlay: paste a free TomTom key below (developer.tomtom.com). Empty = no traffic layer. */
 private const val TOMTOM_KEY = ""
-private const val UA = "OffTheGrid/1.0 (your@email.com)"   // required by Nominatim/Overpass policy
+private const val UA = "OffTheGrid/1.0 (your@email.com)"
+private const val OVERPASS = "https://overpass-api.de/api/interpreter"
 
 private val WBlue = Color(0xFF2D7FF9)
 private val WBlueDark = Color(0xFF1B5FCC)
 private val WGreen = Color(0xFF1E9E4A)
 
 // ------------------------------- DATA --------------------------------
-
 data class Step(val type: String, val mod: String, val name: String, val dist: Double,
                 val lat: Double, val lon: Double, val exit: Int = 0)
 data class RouteData(val points: List<DoubleArray>, val steps: List<Step>, val dist: Double, val dur: Double)
-data class Hazard(val type: String, val lat: Double, val lon: Double, val ts: Long = 0L)  // camera|police|hazard|crash
+data class Hazard(val type: String, val lat: Double, val lon: Double, val ts: Long = 0L) // camera|police|hazard|crash
 data class Place(val name: String, val lat: Double, val lon: Double)
 
 // ------------------------------ HELPERS ------------------------------
-
 fun distM(aLat: Double, aLon: Double, bLat: Double, bLon: Double): Double {
     val r = 6371000.0
-    val dLat = Math.toRadians(bLat - aLat)
-    val dLon = Math.toRadians(bLon - aLon)
+    val dLat = Math.toRadians(bLat - aLat); val dLon = Math.toRadians(bLon - aLon)
     val h = sin(dLat / 2).pow(2) + cos(Math.toRadians(aLat)) * cos(Math.toRadians(bLat)) * sin(dLon / 2).pow(2)
     return 2 * r * asin(sqrt(h))
 }
@@ -120,7 +119,6 @@ fun arrivalTime(sec: Double): String =
         .format(java.util.Date(System.currentTimeMillis() + (sec * 1000).toLong()))
 
 fun ordinal(n: Int) = when (n) { 1 -> "1st"; 2 -> "2nd"; 3 -> "3rd"; else -> "${n}th" }
-
 fun isRoundabout(t: String) = t == "roundabout" || t == "rotary" || t == "roundabout turn"
 
 fun instruction(s: Step): String {
@@ -157,19 +155,12 @@ suspend fun httpPost(url: String, body: String): String = withContext(Dispatcher
 }
 
 // -------------------------- NETWORK SERVICES -------------------------
-
 suspend fun searchPlaces(q: String): List<Place> {
     val j = JSONArray(httpGet("https://nominatim.openstreetmap.org/search?format=json&limit=6&q=" + URLEncoder.encode(q, "UTF-8")))
-    return List(j.length()) {
-        val o = j.getJSONObject(it)
-        Place(o.getString("display_name"), o.getDouble("lat"), o.getDouble("lon"))
-    }
+    return List(j.length()) { val o = j.getJSONObject(it); Place(o.getString("display_name"), o.getDouble("lat"), o.getDouble("lon")) }
 }
 
-suspend fun fetchRoute(aLat: Double, aLon: Double, bLat: Double, bLon: Double): RouteData? {
-    val url = "https://router.project-osrm.org/route/v1/driving/$aLon,$aLat;$bLon,$bLat" +
-            "?overview=full&geometries=geojson&steps=true"
-    val r = JSONObject(httpGet(url)).optJSONArray("routes")?.optJSONObject(0) ?: return null
+fun parseRoute(r: JSONObject): RouteData {
     val coords = r.getJSONObject("geometry").getJSONArray("coordinates")
     val pts = List(coords.length()) { val c = coords.getJSONArray(it); doubleArrayOf(c.getDouble(0), c.getDouble(1)) }
     val st = r.getJSONArray("legs").getJSONObject(0).getJSONArray("steps")
@@ -181,22 +172,39 @@ suspend fun fetchRoute(aLat: Double, aLon: Double, bLat: Double, bLon: Double): 
     return RouteData(pts, steps, r.getDouble("distance"), r.getDouble("duration"))
 }
 
+/** Main route + alternatives (OSRM demo server, OSM data). */
+suspend fun fetchRoutes(aLat: Double, aLon: Double, bLat: Double, bLon: Double): List<RouteData> {
+    val url = "https://router.project-osrm.org/route/v1/driving/$aLon,$aLat;$bLon,$bLat" +
+            "?overview=full&geometries=geojson&steps=true&alternatives=true"
+    val arr = JSONObject(httpGet(url)).optJSONArray("routes") ?: return emptyList()
+    return List(arr.length()) { parseRoute(arr.getJSONObject(it)) }
+}
+
 suspend fun fetchCameras(s: Double, w: Double, n: Double, e: Double): List<Hazard> {
     val q = "[out:json][timeout:20];(node[\"highway\"=\"speed_camera\"]($s,$w,$n,$e););out;"
-    val j = JSONObject(httpPost("https://overpass-api.de/api/interpreter", "data=" + URLEncoder.encode(q, "UTF-8")))
-    val el = j.getJSONArray("elements")
+    val el = JSONObject(httpPost(OVERPASS, "data=" + URLEncoder.encode(q, "UTF-8"))).getJSONArray("elements")
     return List(el.length()) { val o = el.getJSONObject(it); Hazard("camera", o.getDouble("lat"), o.getDouble("lon")) }
 }
 
-// --------------------- LOCAL (USER) REPORTS STORE --------------------
-// Waze reports are crowd-sourced through Waze's servers (no public API). Here they are kept
-// on-device for 2 hours. To share between users you need a backend (e.g. Firebase Firestore).
+/** Speed limit of the road you are on, from OSM maxspeed tags (coverage varies by country). */
+suspend fun fetchSpeedLimit(lat: Double, lon: Double): Int? {
+    val q = "[out:json][timeout:8];way(around:25,$lat,$lon)[\"highway\"][\"maxspeed\"];out tags 5;"
+    val el = JSONObject(httpPost(OVERPASS, "data=" + URLEncoder.encode(q, "UTF-8"))).getJSONArray("elements")
+    for (i in 0 until el.length()) {
+        val ms = el.getJSONObject(i).getJSONObject("tags").optString("maxspeed", "")
+        val n = Regex("\\d+").find(ms)?.value?.toIntOrNull() ?: continue
+        return if (ms.contains("mph")) (n * 1.609).roundToInt() else n
+    }
+    return null
+}
 
+// --------------------------- LOCAL STORAGE ---------------------------
+// Police/hazard reports live on this device for 2 hours. Sharing them between users needs a backend (e.g. Firebase).
 private const val REPORT_TTL = 2 * 60 * 60 * 1000L
+private fun prefs(ctx: Context) = ctx.getSharedPreferences("offthegrid", Context.MODE_PRIVATE)
 
 fun loadReports(ctx: Context): List<Hazard> {
-    val raw = ctx.getSharedPreferences("offthegrid", Context.MODE_PRIVATE).getString("reports", "[]") ?: "[]"
-    val a = JSONArray(raw); val now = System.currentTimeMillis()
+    val a = JSONArray(prefs(ctx).getString("reports", "[]") ?: "[]"); val now = System.currentTimeMillis()
     return List(a.length()) { a.getJSONObject(it) }
         .map { Hazard(it.getString("t"), it.getDouble("la"), it.getDouble("lo"), it.getLong("ts")) }
         .filter { now - it.ts < REPORT_TTL }
@@ -205,26 +213,42 @@ fun loadReports(ctx: Context): List<Hazard> {
 fun saveReports(ctx: Context, list: List<Hazard>) {
     val a = JSONArray()
     list.forEach { a.put(JSONObject().put("t", it.type).put("la", it.lat).put("lo", it.lon).put("ts", it.ts)) }
-    ctx.getSharedPreferences("offthegrid", Context.MODE_PRIVATE).edit().putString("reports", a.toString()).apply()
+    prefs(ctx).edit().putString("reports", a.toString()).apply()
+}
+
+fun loadPlace(ctx: Context, key: String): Place? =
+    prefs(ctx).getString(key, null)?.split("|")?.let { if (it.size == 3) Place(it[0], it[1].toDouble(), it[2].toDouble()) else null }
+
+fun savePlace(ctx: Context, key: String, p: Place) =
+    prefs(ctx).edit().putString(key, "${p.name.replace("|", " ")}|${p.lat}|${p.lon}").apply()
+
+fun loadRecents(ctx: Context): List<Place> {
+    val a = JSONArray(prefs(ctx).getString("recents", "[]") ?: "[]")
+    return List(a.length()) { val o = a.getJSONObject(it); Place(o.getString("n"), o.getDouble("la"), o.getDouble("lo")) }
+}
+
+fun saveRecents(ctx: Context, list: List<Place>) {
+    val a = JSONArray()
+    list.forEach { a.put(JSONObject().put("n", it.name).put("la", it.lat).put("lo", it.lon)) }
+    prefs(ctx).edit().putString("recents", a.toString()).apply()
 }
 
 // ----------------------------- MAP STYLE -----------------------------
-
 fun styleJson(): String {
     val esri = "https://server.arcgisonline.com/ArcGIS/rest/services"
     val traffic = if (TOMTOM_KEY.isBlank()) "" else """,
-      "traffic":{"type":"raster","tileSize":256,"maxzoom":18,
+      "traffic":{"type":"raster","tileSize":256,"maxzoom":14,
         "tiles":["https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=$TOMTOM_KEY"]}"""
     val trafficLayer = if (TOMTOM_KEY.isBlank()) "" else
         """,{"id":"traffic","type":"raster","source":"traffic","paint":{"raster-opacity":0.9}}"""
     return """
     {"version":8,
      "sources":{
-      "sat":{"type":"raster","tileSize":256,"maxzoom":19,"attribution":"Imagery © Esri, Maxar, Earthstar Geographics",
+      "sat":{"type":"raster","tileSize":256,"maxzoom":15,"attribution":"Imagery © Esri, Maxar, Earthstar Geographics",
         "tiles":["$esri/World_Imagery/MapServer/tile/{z}/{y}/{x}"]},
-      "roads":{"type":"raster","tileSize":256,"maxzoom":19,
+      "roads":{"type":"raster","tileSize":256,"maxzoom":15,
         "tiles":["$esri/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"]},
-      "places":{"type":"raster","tileSize":256,"maxzoom":19,
+      "places":{"type":"raster","tileSize":256,"maxzoom":15,
         "tiles":["$esri/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"]}$traffic},
      "layers":[
       {"id":"sat","type":"raster","source":"sat"}$trafficLayer,
@@ -233,7 +257,6 @@ fun styleJson(): String {
     """.trimIndent()
 }
 
-/** Round map badge (emoji on coloured circle with white ring), like Waze report pins. */
 fun badge(emoji: String, bg: Int): Bitmap {
     val s = 96
     val bmp = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
@@ -247,14 +270,17 @@ fun badge(emoji: String, bg: Int): Bitmap {
 }
 
 // ----------------------------- ACTIVITY ------------------------------
-
 class MainActivity : ComponentActivity() {
     private var mapView: MapView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         MapLibre.getInstance(this)
-        setContent { MaterialTheme { NaviApp { mapView = it } } }
+        setContent {
+            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+                NaviApp { mapView = it }
+            }
+        }
     }
 
     override fun onStart() { super.onStart(); mapView?.onStart() }
@@ -266,11 +292,12 @@ class MainActivity : ComponentActivity() {
 }
 
 // ------------------------------- UI ----------------------------------
-
 @SuppressLint("MissingPermission")
 @Composable
 fun NaviApp(onMapView: (MapView) -> Unit) {
     val ctx = LocalContext.current
+    val view = LocalView.current
+    val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
 
     var map by remember { mutableStateOf<MapLibreMap?>(null) }
@@ -281,9 +308,16 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
     var myLoc by remember { mutableStateOf<Location?>(null) }
 
     var query by remember { mutableStateOf("") }
+    var focused by remember { mutableStateOf(false) }
     var results by remember { mutableStateOf<List<Place>>(emptyList()) }
+    var recents by remember { mutableStateOf(loadRecents(ctx)) }
+    var home by remember { mutableStateOf(loadPlace(ctx, "home")) }
+    var work by remember { mutableStateOf(loadPlace(ctx, "work")) }
+
     var dest by remember { mutableStateOf<Place?>(null) }
-    var route by remember { mutableStateOf<RouteData?>(null) }
+    var routes by remember { mutableStateOf<List<RouteData>>(emptyList()) }
+    var sel by remember { mutableIntStateOf(0) }
+    val route = routes.getOrNull(sel)
     var navigating by remember { mutableStateOf(false) }
     var stepIdx by remember { mutableIntStateOf(0) }
     var progressIdx by remember { mutableIntStateOf(0) }
@@ -291,17 +325,25 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
     var distToNext by remember { mutableDoubleStateOf(0.0) }
     var rerouting by remember { mutableStateOf(false) }
     var following by remember { mutableStateOf(true) }
+    var limit by remember { mutableStateOf<Int?>(null) }
     var msg by remember { mutableStateOf<String?>(null) }
     var cameras by remember { mutableStateOf<List<Hazard>>(emptyList()) }
     var reports by remember { mutableStateOf(loadReports(ctx)) }
     var reportMenu by remember { mutableStateOf(false) }
     var camsLoaded by remember { mutableStateOf(false) }
+    var lastBearing by remember { mutableFloatStateOf(0f) }
 
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         hasPerm = it[Manifest.permission.ACCESS_FINE_LOCATION] == true
     }
     LaunchedEffect(Unit) {
         if (!hasPerm) permLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+    }
+
+    // keep the screen on while navigating
+    DisposableEffect(navigating) {
+        view.keepScreenOn = navigating
+        onDispose { view.keepScreenOn = false }
     }
 
     DisposableEffect(hasPerm) {
@@ -318,19 +360,25 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
     fun startRoute(p: Place) {
         val me = myLoc
         if (me == null) { msg = "Waiting for GPS fix..."; return }
-        dest = p; results = emptyList(); msg = "Calculating route..."
+        focusManager.clearFocus()
+        dest = p; results = emptyList(); query = ""; msg = "Calculating route..."
+        recents = (listOf(p) + recents.filter { it.name != p.name }).take(5); saveRecents(ctx, recents)
         scope.launch {
-            val r = runCatching { fetchRoute(me.latitude, me.longitude, p.lat, p.lon) }.getOrNull()
-            if (r == null) { msg = "No route found"; return@launch }
-            route = r; stepIdx = 0; progressIdx = 0; msg = null
-            remDist = r.dist
-            distToNext = r.steps.getOrNull(1)?.let { distM(me.latitude, me.longitude, it.lat, it.lon) } ?: 0.0
-            val pts = r.points.map { LatLng(it[1], it[0]) }
-            map?.easeCamera(CameraUpdateFactory.newLatLngBounds(LatLngBounds.fromLatLngs(pts), 200), 800)
+            val rs = runCatching { fetchRoutes(me.latitude, me.longitude, p.lat, p.lon) }.getOrDefault(emptyList())
+            if (rs.isEmpty()) { msg = "No route found"; return@launch }
+            routes = rs; sel = 0; stepIdx = 0; progressIdx = 0; msg = null
+            remDist = rs[0].dist
+            distToNext = rs[0].steps.getOrNull(1)?.let { distM(me.latitude, me.longitude, it.lat, it.lon) } ?: 0.0
+            val pts = rs[0].points.map { LatLng(it[1], it[0]) }
+            map?.easeCamera(CameraUpdateFactory.newLatLngBounds(LatLngBounds.fromLatLngs(pts), 220), 800)
         }
     }
 
-    fun cancelRoute() { navigating = false; route = null; dest = null; stepIdx = 0; progressIdx = 0; following = true }
+    fun cancelRoute() {
+        navigating = false; routes = emptyList(); sel = 0; dest = null; stepIdx = 0; progressIdx = 0; following = true
+        map?.easeCamera(CameraUpdateFactory.tiltTo(0.0))
+        map?.easeCamera(CameraUpdateFactory.bearingTo(0.0))
+    }
 
     fun report(type: String) {
         val l = myLoc
@@ -341,9 +389,18 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         reportMenu = false
     }
 
+    fun confirm(h: Hazard, still: Boolean) {
+        reports = if (still) reports.map { if (it === h) it.copy(ts = System.currentTimeMillis()) else it }
+        else reports.filter { it !== h }
+        saveReports(ctx, reports); msg = "Thanks!"
+    }
+
     // ---- map layers ----
     LaunchedEffect(style) {
         val st = style ?: return@LaunchedEffect
+        st.addSource(GeoJsonSource("alt"))
+        st.addLayer(LineLayer("alt-line", "alt").withProperties(
+            lineColor("#9E9E9E"), lineWidth(9f), lineOpacity(0.9f), lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND)))
         st.addSource(GeoJsonSource("route"))
         st.addLayer(LineLayer("route-casing", "route").withProperties(
             lineColor("#FFFFFF"), lineWidth(12f), lineCap(Property.LINE_CAP_ROUND), lineJoin(Property.LINE_JOIN_ROUND)))
@@ -361,7 +418,7 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
             circleRadius(10f), circleColor("#D32F2F"), circleStrokeColor("#FFFFFF"), circleStrokeWidth(3f)))
     }
 
-    // ---- location arrow + camera mode ----
+    // ---- location arrow + camera mode (while navigating, the follow camera below takes over) ----
     LaunchedEffect(hasPerm, style, route, navigating) {
         val st = style ?: return@LaunchedEffect
         val m = map ?: return@LaunchedEffect
@@ -370,22 +427,47 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         if (!lc.isLocationComponentActivated) {
             lc.activateLocationComponent(LocationComponentActivationOptions.builder(ctx, st).useDefaultLocationEngine(true).build())
             lc.addOnCameraTrackingChangedListener(object : OnCameraTrackingChangedListener {
-                override fun onCameraTrackingDismissed() { following = false }
-                override fun onCameraTrackingChanged(currentMode: Int) { following = currentMode != CameraMode.NONE }
+                override fun onCameraTrackingDismissed() { if (!navigating) following = false }
+                override fun onCameraTrackingChanged(currentMode: Int) { if (!navigating) following = currentMode != CameraMode.NONE }
             })
         }
         lc.isLocationComponentEnabled = true
         lc.renderMode = RenderMode.GPS
-        lc.cameraMode = when {
-            navigating -> CameraMode.TRACKING_GPS
-            route != null -> CameraMode.NONE
-            else -> CameraMode.TRACKING
-        }
-        lc.zoomWhileTracking(if (navigating) 17.0 else 15.0)
-        lc.tiltWhileTracking(if (navigating) 50.0 else 0.0)
+        lc.cameraMode = if (!navigating && route == null) CameraMode.TRACKING else CameraMode.NONE
+        lc.zoomWhileTracking(15.0)
+        lc.tiltWhileTracking(0.0)
     }
 
-    // ---- push data to map (only the remaining part of the route while driving) ----
+    val kmh = ((myLoc?.speed ?: 0f) * 3.6f).roundToInt()
+
+    // ---- Waze-style follow camera: tilt, heading-up, zoom by speed, closer near turns ----
+    LaunchedEffect(navigating) {
+        map?.setPadding(0, if (navigating) (view.height * 0.30).toInt() else 0, 0, 0)   // arrow sits low on screen
+    }
+    LaunchedEffect(myLoc, navigating, following, kmh / 10, distToNext < 150) {
+        val m = map ?: return@LaunchedEffect
+        val l = myLoc ?: return@LaunchedEffect
+        if (!navigating || !following) return@LaunchedEffect
+        if (l.hasBearing() && l.speed > 1.5f) lastBearing = l.bearing
+        val base = (17.0 - kmh * 0.02).coerceIn(15.6, 17.1)       // standing ≈ 17.4, 130 km/h ≈ 15.6
+        val zoom = if (distToNext < 150) min(base + 0.5, 17.0) else base
+        val pos = CameraPosition.Builder()
+            .target(LatLng(l.latitude, l.longitude)).zoom(zoom).tilt(55.0).bearing(lastBearing.toDouble()).build()
+        m.easeCamera(CameraUpdateFactory.newCameraPosition(pos), 900)
+    }
+
+    // ---- speed limit lookup ----
+    LaunchedEffect(hasPerm) {
+        while (true) {
+            val l = myLoc
+            if (l != null && l.speed > 1f) {
+                limit = runCatching { fetchSpeedLimit(l.latitude, l.longitude) }.getOrNull() ?: limit
+            }
+            delay(10000)
+        }
+    }
+
+    // ---- push data to map ----
     LaunchedEffect(style, route, progressIdx, navigating) {
         val st = style ?: return@LaunchedEffect
         val pts = route?.points?.let { if (navigating) it.drop(progressIdx) else it }
@@ -393,6 +475,14 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
             FeatureCollection.fromFeature(Feature.fromGeometry(LineString.fromLngLats(pts.map { Point.fromLngLat(it[0], it[1]) })))
         else FeatureCollection.fromFeatures(emptyList<Feature>())
         st.getSourceAs<GeoJsonSource>("route")?.setGeoJson(fc)
+    }
+    LaunchedEffect(style, routes, sel, navigating) {
+        val st = style ?: return@LaunchedEffect
+        val feats: List<Feature> = if (navigating) emptyList() else
+            routes.filterIndexed { i, _ -> i != sel }.map { r ->
+                Feature.fromGeometry(LineString.fromLngLats(r.points.map { Point.fromLngLat(it[0], it[1]) }))
+            }
+        st.getSourceAs<GeoJsonSource>("alt")?.setGeoJson(FeatureCollection.fromFeatures(feats))
     }
     LaunchedEffect(style, dest) {
         val st = style ?: return@LaunchedEffect
@@ -445,16 +535,14 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         if (best > 70 && !rerouting) {
             val d = dest ?: return@LaunchedEffect
             rerouting = true; msg = "Recalculating..."
-            val nr = runCatching { fetchRoute(l.latitude, l.longitude, d.lat, d.lon) }.getOrNull()
-            if (nr != null) { route = nr; stepIdx = 0; progressIdx = 0 }
+            val nr = runCatching { fetchRoutes(l.latitude, l.longitude, d.lat, d.lon) }.getOrNull()
+            if (!nr.isNullOrEmpty()) { routes = listOf(nr[0]); sel = 0; stepIdx = 0; progressIdx = 0 }
             msg = null; rerouting = false
         }
     }
 
     LaunchedEffect(msg) {
-        if (msg != null && msg != "Recalculating..." && msg != "Calculating route...") {
-            kotlinx.coroutines.delay(2500); msg = null
-        }
+        if (msg != null && msg != "Recalculating..." && msg != "Calculating route...") { delay(2500); msg = null }
     }
 
     val warning = remember(myLoc, cameras, reports) {
@@ -462,8 +550,8 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
         (cameras + reports).map { it to distM(l.latitude, l.longitude, it.lat, it.lon) }
             .filter { it.second < 500 }.minByOrNull { it.second }
     }
-    val kmh = ((myLoc?.speed ?: 0f) * 3.6f).roundToInt()
-    val bottomPad = if (route != null) 118.dp else 24.dp
+    val over = limit != null && kmh > limit!! + 3
+    val bottomPad = when { navigating -> 118.dp; route != null -> 215.dp; else -> 24.dp }
 
     // ================================ LAYOUT ================================
     Box(Modifier.fillMaxSize()) {
@@ -474,6 +562,9 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
                 onMapView(mv)
                 mv.getMapAsync { m ->
                     map = m
+                    m.addOnCameraMoveStartedListener { reason ->
+                        if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE && navigating) following = false
+                    }
                     m.uiSettings.isCompassEnabled = false
                     m.uiSettings.isLogoEnabled = false
                     m.setStyle(Style.Builder().fromJson(styleJson())) { style = it }
@@ -518,7 +609,8 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
                 Surface(shape = RoundedCornerShape(30.dp), shadowElevation = 8.dp) {
                     OutlinedTextField(
                         value = query, onValueChange = { query = it },
-                        modifier = Modifier.fillMaxWidth(), singleLine = true,
+                        modifier = Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
+                        singleLine = true,
                         placeholder = { Text("Where to?", fontSize = 17.sp) },
                         leadingIcon = { Text("🔍", fontSize = 18.sp) },
                         shape = RoundedCornerShape(30.dp),
@@ -531,12 +623,17 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
                         }
                     )
                 }
-                if (results.isNotEmpty()) {
-                    Surface(Modifier.padding(top = 6.dp), shape = RoundedCornerShape(18.dp), shadowElevation = 8.dp) {
+                Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Chip("🏠 Home") { home?.let { startRoute(it) } ?: run { msg = "Pick a destination, then tap \"Set as Home\"" } }
+                    Chip("💼 Work") { work?.let { startRoute(it) } ?: run { msg = "Pick a destination, then tap \"Set as Work\"" } }
+                }
+                val list = if (results.isNotEmpty()) results else if (focused && query.isEmpty()) recents else emptyList()
+                if (list.isNotEmpty()) {
+                    Surface(Modifier.padding(top = 8.dp), shape = RoundedCornerShape(18.dp), shadowElevation = 8.dp) {
                         Column {
-                            results.forEach { p ->
+                            list.forEach { p ->
                                 Row(Modifier.fillMaxWidth().clickable { startRoute(p) }.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Text("📍", fontSize = 18.sp); Spacer(Modifier.width(10.dp))
+                                    Text(if (results.isNotEmpty()) "📍" else "🕘", fontSize = 18.sp); Spacer(Modifier.width(10.dp))
                                     Text(p.name, maxLines = 2, fontSize = 14.sp)
                                 }
                                 HorizontalDivider()
@@ -555,6 +652,12 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
                 }
                 Text("$label ahead · ${fmtDist(d)}", color = Color.White, fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(top = 8.dp).background(col, RoundedCornerShape(14.dp)).padding(horizontal = 14.dp, vertical = 8.dp))
+                if (h.ts > 0 && d < 200) {
+                    Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Chip("👍 Still there") { confirm(h, true) }
+                        Chip("👎 Not there") { confirm(h, false) }
+                    }
+                }
             }
             msg?.let {
                 Text(it, color = Color.White, modifier = Modifier.padding(top = 8.dp)
@@ -562,18 +665,31 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
             }
         }
 
-        // ---------- SPEED BUBBLE ----------
+        // ---------- SPEED BUBBLE + SPEED LIMIT ----------
         if (hasPerm && myLoc != null) {
-            Box(
-                Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = bottomPad + 8.dp)
-                    .size(66.dp).shadow(8.dp, CircleShape).background(Color.White, CircleShape)
-                    .border(3.dp, Color(0xFFBDBDBD), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("$kmh", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color(0xFF263238))
-                    Text("km/h", fontSize = 9.sp, color = Color.Gray)
+            Row(Modifier.align(Alignment.BottomStart).padding(start = 12.dp, bottom = bottomPad + 8.dp),
+                verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Box(
+                    Modifier.size(66.dp).shadow(8.dp, CircleShape).background(MaterialTheme.colorScheme.surface, CircleShape)
+                        .border(3.dp, if (over) Color(0xFFD32F2F) else Color(0xFFBDBDBD), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("$kmh", fontSize = 24.sp, fontWeight = FontWeight.Bold,
+                            color = if (over) Color(0xFFD32F2F) else MaterialTheme.colorScheme.onSurface)
+                        Text("km/h", fontSize = 9.sp, color = Color.Gray)
+                    }
                 }
+                limit?.let { LimitSign(it) }
+            }
+        }
+
+        // ---------- CURRENT ROAD ----------
+        val roadName = route?.steps?.getOrNull(stepIdx)?.name
+        if (navigating && !roadName.isNullOrBlank()) {
+            Surface(Modifier.align(Alignment.BottomCenter).padding(bottom = bottomPad + 8.dp),
+                shape = RoundedCornerShape(20.dp), shadowElevation = 8.dp) {
+                Text(roadName, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), fontSize = 14.sp, fontWeight = FontWeight.Medium)
             }
         }
 
@@ -582,9 +698,8 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
             horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(12.dp)) {
             if (navigating && !following) {
                 Row(Modifier.shadow(8.dp, RoundedCornerShape(26.dp)).background(WBlue, RoundedCornerShape(26.dp))
-                    .clickable {
-                        map?.locationComponent?.cameraMode = CameraMode.TRACKING_GPS; following = true
-                    }.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                    .clickable { following = true }
+                    .padding(horizontal = 16.dp, vertical = 12.dp)) {
                     Text("➤ Re-center", color = Color.White, fontWeight = FontWeight.Bold)
                 }
             }
@@ -614,23 +729,49 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
                 shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp), shadowElevation = 16.dp) {
                 val dist = if (navigating) remDist else r.dist
                 val dur = if (navigating && r.dist > 0) r.dur * remDist / r.dist else r.dur
-                Row(Modifier.navigationBarsPadding().padding(horizontal = 16.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (navigating) {
-                        RoundBtn("✕", bg = Color(0xFFEEEEEE), size = 48.dp) { cancelRoute() }
+                if (navigating) {
+                    Row(Modifier.navigationBarsPadding().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        RoundBtn("✕", bg = MaterialTheme.colorScheme.surfaceVariant, size = 48.dp) { cancelRoute() }
                         Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(fmtDur(dur), fontSize = 26.sp, fontWeight = FontWeight.Bold, color = WGreen)
+                            Text("${fmtDist(dist)}  ·  ${arrivalTime(dur)}", fontSize = 13.sp, color = Color.Gray, maxLines = 1)
+                        }
                     }
-                    Column(Modifier.weight(1f)) {
-                        Text(fmtDur(dur), fontSize = 26.sp, fontWeight = FontWeight.Bold, color = WGreen)
-                        Text("${fmtDist(dist)}  ·  ${arrivalTime(dur)}" + if (!navigating) "  ·  ${dest?.name?.take(24) ?: ""}" else "",
-                            fontSize = 13.sp, color = Color.Gray, maxLines = 1)
-                    }
-                    if (!navigating) {
-                        TextButton(onClick = { cancelRoute() }) { Text("Cancel") }
-                        Spacer(Modifier.width(6.dp))
-                        Button(onClick = { navigating = true; stepIdx = 0; progressIdx = 0 },
-                            colors = ButtonDefaults.buttonColors(containerColor = WBlue),
-                            shape = RoundedCornerShape(26.dp), modifier = Modifier.height(52.dp)) {
-                            Text("Go", fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 14.dp))
+                } else {
+                    Column(Modifier.navigationBarsPadding().padding(16.dp)) {
+                        Text(dest?.name?.take(60) ?: "", fontSize = 13.sp, color = Color.Gray, maxLines = 1)
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            routes.forEachIndexed { i, rt ->
+                                val on = i == sel
+                                Column(Modifier.clip(RoundedCornerShape(14.dp))
+                                    .background(if (on) WBlue else MaterialTheme.colorScheme.surfaceVariant)
+                                    .clickable { sel = i }.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                    Text(fmtDur(rt.dur) + if (i == 0) "  ·  Fastest" else "", fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                                        color = if (on) Color.White else MaterialTheme.colorScheme.onSurface)
+                                    Text(fmtDist(rt.dist), fontSize = 11.sp, color = if (on) Color.White else Color.Gray)
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(fmtDur(dur), fontSize = 26.sp, fontWeight = FontWeight.Bold, color = WGreen)
+                                Text("${fmtDist(dist)}  ·  arrive ${arrivalTime(dur)}", fontSize = 13.sp, color = Color.Gray)
+                            }
+                            TextButton(onClick = { cancelRoute() }) { Text("Cancel") }
+                            Spacer(Modifier.width(6.dp))
+                            Button(onClick = { navigating = true; stepIdx = 0; progressIdx = 0; following = true },
+                                colors = ButtonDefaults.buttonColors(containerColor = WBlue),
+                                shape = RoundedCornerShape(26.dp), modifier = Modifier.height(52.dp)) {
+                                Text("Go", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White,
+                                    modifier = Modifier.padding(horizontal = 14.dp))
+                            }
+                        }
+                        Row {
+                            TextButton(onClick = { dest?.let { home = it; savePlace(ctx, "home", it); msg = "Home saved" } }) { Text("🏠 Set as Home", fontSize = 12.sp) }
+                            TextButton(onClick = { dest?.let { work = it; savePlace(ctx, "work", it); msg = "Work saved" } }) { Text("💼 Set as Work", fontSize = 12.sp) }
                         }
                     }
                 }
@@ -639,17 +780,25 @@ fun NaviApp(onMapView: (MapView) -> Unit) {
     }
 }
 
+// ---------------------------- SMALL WIDGETS ----------------------------
 @Composable
-fun RoundBtn(label: String, bg: Color = Color.White, size: Dp = 56.dp, onClick: () -> Unit) {
+fun Chip(label: String, onClick: () -> Unit) {
+    Surface(Modifier.clickable { onClick() }, shape = RoundedCornerShape(20.dp), shadowElevation = 6.dp) {
+        Text(label, Modifier.padding(horizontal = 14.dp, vertical = 8.dp), fontSize = 14.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
+@Composable
+fun RoundBtn(label: String, bg: Color = MaterialTheme.colorScheme.surface, size: Dp = 56.dp, onClick: () -> Unit) {
     Box(Modifier.size(size).shadow(8.dp, CircleShape).clip(CircleShape).background(bg).clickable { onClick() },
-        contentAlignment = Alignment.Center) { Text(label, fontSize = 22.sp) }
+        contentAlignment = Alignment.Center) { Text(label, fontSize = 22.sp, color = MaterialTheme.colorScheme.onSurface) }
 }
 
 @Composable
 fun ReportTile(emoji: String, label: String, onClick: () -> Unit) {
     Column(Modifier.clip(RoundedCornerShape(16.dp)).clickable { onClick() }.padding(10.dp),
         horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(Modifier.size(58.dp).background(Color(0xFFF1F3F4), CircleShape), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(58.dp).background(MaterialTheme.colorScheme.surfaceVariant, CircleShape), contentAlignment = Alignment.Center) {
             Text(emoji, fontSize = 28.sp)
         }
         Spacer(Modifier.height(4.dp))
@@ -657,8 +806,15 @@ fun ReportTile(emoji: String, label: String, onClick: () -> Unit) {
     }
 }
 
-// ---------------- Standard turn arrows (drawn on Canvas) ----------------
+@Composable
+fun LimitSign(limit: Int) {
+    Box(Modifier.size(54.dp).shadow(6.dp, CircleShape).background(Color.White, CircleShape)
+        .border(5.dp, Color(0xFFD32F2F), CircleShape), contentAlignment = Alignment.Center) {
+        Text("$limit", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+    }
+}
 
+// ---------------- Standard turn arrows (drawn on Canvas) ----------------
 fun turnAngle(mod: String): Double = Math.toRadians(when (mod) {
     "left" -> -90.0; "slight left" -> -45.0; "sharp left" -> -135.0
     "right" -> 90.0; "slight right" -> 45.0; "sharp right" -> 135.0

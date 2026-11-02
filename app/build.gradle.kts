@@ -57,4 +57,8 @@ dependencies {
     implementation("androidx.graphics:graphics-path:1.0.1")
 
     implementation("androidx.core:core-ktx:1.15.0")
+
+    // Android Auto (Car App Library)
+    implementation("androidx.car.app:app:1.7.0")
+    implementation("androidx.car.app:app-projected:1.7.0")
 }
