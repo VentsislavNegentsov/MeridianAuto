@@ -1,54 +1,78 @@
 package com.offthegrid
 
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
+import android.app.Presentation
+import android.content.Context
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.graphics.Rect
+import android.os.Bundle
+import android.view.ViewGroup
 import androidx.car.app.CarContext
 import androidx.car.app.SurfaceCallback
 import androidx.car.app.SurfaceContainer
+import androidx.lifecycle.LifecycleOwner
+import org.maplibre.android.MapLibre
+import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.camera.CameraUpdateFactory
+import org.maplibre.android.maps.MapView
+import org.maplibre.android.maps.Style
 
-class OffTheGridSurfaceCallback(private val carContext: CarContext) : SurfaceCallback {
+class OffTheGridSurfaceCallback(
+    private val carContext: CarContext,
+    private val sessionLifecycleOwner: LifecycleOwner
+) : SurfaceCallback {
+
+    private var virtualDisplay: VirtualDisplay? = null
+    private var presentation: Presentation? = null
+    private var mapView: MapView? = null
+
     override fun onSurfaceAvailable(surfaceContainer: SurfaceContainer) {
-        drawCanvas(surfaceContainer)
-    }
+        runCatching { MapLibre.getInstance(carContext) }
+        val displayManager = carContext.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
 
-    override fun onSurfaceSizeChanged(width: Int, height: Int) {
-        // Automatically adapts to resolution/orientation changes
+        virtualDisplay = displayManager.createVirtualDisplay(
+            "OffTheGridMap",
+            surfaceContainer.width,
+            surfaceContainer.height,
+            surfaceContainer.dpi,
+            surfaceContainer.surface,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+        )
+
+        val display = virtualDisplay?.display ?: return
+        presentation = Presentation(carContext, display).apply {
+            val mv = MapView(carContext).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+            mapView = mv
+            mv.onCreate(Bundle())
+            mv.getMapAsync { map ->
+                map.setStyle(Style.Builder().fromJson(styleJson())) {
+                    map.moveCamera(CameraUpdateFactory.newLatLngZoom(LatLng(42.6977, 23.3219), 15.0))
+                }
+            }
+            mv.onStart()
+            mv.onResume()
+
+            setContentView(mv)
+            show()
+        }
     }
 
     override fun onVisibleAreaChanged(visibleArea: Rect) {}
     override fun onStableAreaChanged(stableArea: Rect) {}
 
-    private fun drawCanvas(container: SurfaceContainer) {
-        val surface = container.surface ?: return
-        val canvas: Canvas = try {
-            surface.lockCanvas(null)
-        } catch (e: Exception) {
-            return
-        }
-
-        try {
-            val isDark = carContext.isDarkMode
-            canvas.drawColor(if (isDark) Color.parseColor("#121212") else Color.parseColor("#F4F4F4"))
-
-            val paint = Paint().apply {
-                color = if (isDark) Color.parseColor("#222222") else Color.parseColor("#E0E0E0")
-                strokeWidth = 2f
-            }
-            val step = 100f
-            var x = 0f
-            while (x < container.width) {
-                canvas.drawLine(x, 0f, x, container.height.toFloat(), paint)
-                x += step
-            }
-            var y = 0f
-            while (y < container.height) {
-                canvas.drawLine(0f, y, container.width.toFloat(), y, paint)
-                y += step
-            }
-        } finally {
-            runCatching { surface.unlockCanvasAndPost(canvas) }
-        }
+    override fun onSurfaceDestroyed(surfaceContainer: SurfaceContainer) {
+        mapView?.onPause()
+        mapView?.onStop()
+        mapView?.onDestroy()
+        presentation?.dismiss()
+        virtualDisplay?.release()
+        presentation = null
+        virtualDisplay = null
+        mapView = null
     }
 }

@@ -235,7 +235,6 @@ fun saveRecents(ctx: Context, list: List<Place>) {
 
 // ----------------------------- MAP STYLE -----------------------------
 fun styleJson(): String {
-    val esri = "https://server.arcgisonline.com/ArcGIS/rest/services"
     val traffic = if (TOMTOM_KEY.isBlank()) "" else """,
       "traffic":{"type":"raster","tileSize":256,"maxzoom":14,
         "tiles":["https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=$TOMTOM_KEY"]}"""
@@ -244,16 +243,10 @@ fun styleJson(): String {
     return """
     {"version":8,
      "sources":{
-      "sat":{"type":"raster","tileSize":256,"maxzoom":15,"attribution":"Imagery © Esri, Maxar, Earthstar Geographics",
-        "tiles":["$esri/World_Imagery/MapServer/tile/{z}/{y}/{x}"]},
-      "roads":{"type":"raster","tileSize":256,"maxzoom":15,
-        "tiles":["$esri/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"]},
-      "places":{"type":"raster","tileSize":256,"maxzoom":15,
-        "tiles":["$esri/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"]}$traffic},
+      "osm":{"type":"raster","tileSize":256,"maxzoom":19,"attribution":"© OpenStreetMap contributors",
+        "tiles":["https://tile.openstreetmap.org/{z}/{x}/{y}.png"]}$traffic},
      "layers":[
-      {"id":"sat","type":"raster","source":"sat"}$trafficLayer,
-      {"id":"roads","type":"raster","source":"roads"},
-      {"id":"places","type":"raster","source":"places"}]}
+      {"id":"osm","type":"raster","source":"osm"}$trafficLayer]}
     """.trimIndent()
 }
 

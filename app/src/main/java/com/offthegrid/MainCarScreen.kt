@@ -10,6 +10,7 @@ import androidx.car.app.CarToast
 import androidx.car.app.Screen
 import androidx.car.app.model.Action
 import androidx.car.app.model.ActionStrip
+import androidx.car.app.model.DateTimeWithZone
 import androidx.car.app.model.Distance
 import androidx.car.app.model.Header
 import androidx.car.app.model.ItemList
@@ -31,7 +32,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.util.TimeZone
 
-class MainCarScreen(carContext: CarContext) : Screen(carContext) {
+class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.LifecycleOwner) : Screen(carContext) {
 
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var myLoc: Location? = null
@@ -50,6 +51,8 @@ class MainCarScreen(carContext: CarContext) : Screen(carContext) {
 
     init {
         startLocationUpdates()
+        carContext.getCarService(androidx.car.app.AppManager::class.java)
+            .setSurfaceCallback(OffTheGridSurfaceCallback(carContext, session))
     }
 
     @SuppressLint("MissingPermission")
@@ -95,7 +98,13 @@ class MainCarScreen(carContext: CarContext) : Screen(carContext) {
                     distM(loc.latitude, loc.longitude, steps[1].lat, steps[1].lon)
                 } else routes[0].dist
 
-                carContext.getCarService(NavigationManager::class.java).navigationStarted()
+                val navManager = carContext.getCarService(NavigationManager::class.java)
+                navManager.setNavigationManagerCallback(object : androidx.car.app.navigation.NavigationManagerCallback {
+                    override fun onStopNavigation() {
+                        cancelNavigation()
+                    }
+                })
+                navManager.navigationStarted()
 
                 // Save to recents
                 val recents = loadRecents(carContext)
@@ -167,9 +176,32 @@ class MainCarScreen(carContext: CarContext) : Screen(carContext) {
             routingInfoBuilder.setNextStep(nextCarStep)
         }
 
+        val remTimeSec = if (route.dist > 0) (remDist / route.dist) * route.dur else 0.0
+        val travelEstimate = TravelEstimate.Builder(
+            Distance.create(remDist, Distance.UNIT_METERS),
+            DateTimeWithZone.create(
+                System.currentTimeMillis() + (remTimeSec * 1000).toLong(),
+                java.util.TimeZone.getDefault()
+            )
+        ).build()
+
+        val trip = Trip.Builder()
+            .addDestination(
+                Destination.Builder()
+                    .setName(destination.name)
+                    .setAddress(destination.name)
+                    .build(),
+                travelEstimate
+            )
+            .addStep(carStep, travelEstimate)
+            .setLoading(false)
+            .build()
+
+        carContext.getCarService(NavigationManager::class.java).updateTrip(trip)
+
         return NavigationTemplate.Builder()
             .setNavigationInfo(routingInfoBuilder.build())
-            .setMapActionStrip(
+            .setActionStrip(
                 ActionStrip.Builder()
                     .addAction(
                         Action.Builder()
@@ -184,18 +216,6 @@ class MainCarScreen(carContext: CarContext) : Screen(carContext) {
                             .setTitle("Cancel")
                             .setOnClickListener {
                                 cancelNavigation()
-                            }
-                            .build()
-                    )
-                    .build()
-            )
-            .setActionStrip(
-                ActionStrip.Builder()
-                    .addAction(
-                        Action.Builder()
-                            .setTitle("Search")
-                            .setOnClickListener {
-                                screenManager.push(SearchCarScreen(carContext, ::startNavigation))
                             }
                             .build()
                     )

@@ -21,7 +21,26 @@ class SearchCarScreen(
     private var searchResults: List<Place> = emptyList()
     private var isLoading = false
 
+    private val searchCallback = object : SearchTemplate.SearchCallback {
+        override fun onSearchSubmitted(searchText: String) {
+            performSearch(searchText)
+        }
+
+        override fun onSearchTextChanged(searchText: String) {
+            if (searchText.length >= 3) {
+                performSearch(searchText)
+            }
+        }
+    }
+
     override fun onGetTemplate(): Template {
+        if (isLoading) {
+            return SearchTemplate.Builder(searchCallback)
+                .setHeaderAction(Action.BACK)
+                .setLoading(true)
+                .build()
+        }
+
         val listBuilder = ItemList.Builder()
         for (place in searchResults) {
             listBuilder.addItem(
@@ -35,19 +54,9 @@ class SearchCarScreen(
             )
         }
 
-        return SearchTemplate.Builder(object : SearchTemplate.SearchCallback {
-            override fun onSearchSubmitted(searchText: String) {
-                performSearch(searchText)
-            }
-
-            override fun onSearchTextChanged(searchText: String) {
-                if (searchText.length >= 3) {
-                    performSearch(searchText)
-                }
-            }
-        })
+        return SearchTemplate.Builder(searchCallback)
             .setHeaderAction(Action.BACK)
-            .setLoading(isLoading)
+            .setLoading(false)
             .setItemList(listBuilder.build())
             .build()
     }
