@@ -45,8 +45,12 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
 
     private val locationListener = LocationListener { location ->
         myLoc = location
+        CarNavState.currentLocation = location
+        CarNavState.route = routeData
+        CarNavState.surfaceCallback?.updateLocation(location)
         updateNavigationState()
         invalidate()
+        carContext.getCarService(androidx.car.app.AppManager::class.java).invalidate()
     }
 
     init {
@@ -75,6 +79,7 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
             latitude = 42.6977
             longitude = 23.3219
         }
+        CarNavState.surfaceCallback?.updateLocation(loc)
 
         isCalculatingRoute = true
         dest = place
@@ -91,6 +96,9 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
                 CarToast.makeText(carContext, "No route found", CarToast.LENGTH_SHORT).show()
             } else {
                 routeData = routes[0]
+                CarNavState.route = routes[0]
+                CarNavState.currentLocation = loc
+                CarNavState.surfaceCallback?.updateRoute(routes[0])
                 stepIdx = 0
                 remDist = routes[0].dist
                 val steps = routes[0].steps
@@ -112,6 +120,7 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
                 saveRecents(carContext, updated)
             }
             invalidate()
+            carContext.getCarService(androidx.car.app.AppManager::class.java).invalidate()
         }
     }
 
@@ -119,10 +128,12 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
         carContext.getCarService(NavigationManager::class.java).navigationEnded()
         dest = null
         routeData = null
+        CarNavState.route = null
         stepIdx = 0
         remDist = 0.0
         distToNext = 0.0
         invalidate()
+        carContext.getCarService(androidx.car.app.AppManager::class.java).invalidate()
     }
 
     private fun updateNavigationState() {
@@ -201,6 +212,7 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
 
         return NavigationTemplate.Builder()
             .setNavigationInfo(routingInfoBuilder.build())
+            .setDestinationTravelEstimate(travelEstimate)
             .setActionStrip(
                 ActionStrip.Builder()
                     .addAction(
