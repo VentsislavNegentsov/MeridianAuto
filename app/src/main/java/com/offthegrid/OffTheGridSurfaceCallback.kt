@@ -23,10 +23,18 @@ import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.expressions.Expression
+import org.maplibre.android.style.layers.Property
+import org.maplibre.android.style.layers.PropertyFactory.*
+import org.maplibre.android.style.layers.SymbolLayer
+import org.maplibre.android.style.sources.GeoJsonSource
+import kotlin.math.max
+import kotlin.math.min
 
 object CarNavState {
     var currentLocation: Location? = null
     var route: RouteData? = null
+    var hazards: List<Hazard> = emptyList()
     var surfaceCallback: OffTheGridSurfaceCallback? = null
 }
 
@@ -68,37 +76,56 @@ class OffTheGridSurfaceCallback(
             mv.onCreate(Bundle())
             mv.getMapAsync { map ->
                 map.setStyle(Style.Builder().fromJson(styleJson())) { style ->
+                    // Navigation arrow
                     style.addImage("car-arrow", createCarArrowBitmap())
-                    style.addSource(org.maplibre.android.style.sources.GeoJsonSource("user-location"))
+                    style.addSource(GeoJsonSource("user-location"))
                     style.addLayer(
-                        org.maplibre.android.style.layers.SymbolLayer("user-location-layer", "user-location").withProperties(
-                            org.maplibre.android.style.layers.PropertyFactory.iconImage("car-arrow"),
-                            org.maplibre.android.style.layers.PropertyFactory.iconAllowOverlap(true),
-                            org.maplibre.android.style.layers.PropertyFactory.iconIgnorePlacement(true),
-                            org.maplibre.android.style.layers.PropertyFactory.iconSize(0.8f),
-                            org.maplibre.android.style.layers.PropertyFactory.iconRotate(org.maplibre.android.style.expressions.Expression.get("bearing")),
-                            org.maplibre.android.style.layers.PropertyFactory.iconRotationAlignment(org.maplibre.android.style.layers.Property.ICON_ROTATION_ALIGNMENT_MAP)
+                        SymbolLayer("user-location-layer", "user-location").withProperties(
+                            iconImage("car-arrow"),
+                            iconAllowOverlap(true),
+                            iconIgnorePlacement(true),
+                            iconSize(0.8f),
+                            iconRotate(Expression.get("bearing")),
+                            iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_MAP)
                         )
                     )
 
-                    style.addSource(org.maplibre.android.style.sources.GeoJsonSource("route"))
+                    // Route lines
+                    style.addSource(GeoJsonSource("route"))
                     style.addLayer(
                         org.maplibre.android.style.layers.LineLayer("route-casing", "route").withProperties(
-                            org.maplibre.android.style.layers.PropertyFactory.lineColor("#FFFFFF"),
-                            org.maplibre.android.style.layers.PropertyFactory.lineWidth(12f),
-                            org.maplibre.android.style.layers.PropertyFactory.lineCap(org.maplibre.android.style.layers.Property.LINE_CAP_ROUND),
-                            org.maplibre.android.style.layers.PropertyFactory.lineJoin(org.maplibre.android.style.layers.Property.LINE_JOIN_ROUND)
+                            lineColor("#FFFFFF"),
+                            lineWidth(12f),
+                            lineCap(Property.LINE_CAP_ROUND),
+                            lineJoin(Property.LINE_JOIN_ROUND)
                         )
                     )
                     style.addLayer(
                         org.maplibre.android.style.layers.LineLayer("route-line", "route").withProperties(
-                            org.maplibre.android.style.layers.PropertyFactory.lineColor("#2D7FF9"),
-                            org.maplibre.android.style.layers.PropertyFactory.lineWidth(8f),
-                            org.maplibre.android.style.layers.PropertyFactory.lineCap(org.maplibre.android.style.layers.Property.LINE_CAP_ROUND),
-                            org.maplibre.android.style.layers.PropertyFactory.lineJoin(org.maplibre.android.style.layers.Property.LINE_JOIN_ROUND)
+                            lineColor("#2D7FF9"),
+                            lineWidth(8f),
+                            lineCap(Property.LINE_CAP_ROUND),
+                            lineJoin(Property.LINE_JOIN_ROUND)
                         )
                     )
+
+                    // Hazards icons
+                    style.addImage("camera", badge("📷", 0xFFFF6D00.toInt()))
+                    style.addImage("police", badge("🚓", 0xFF1565C0.toInt()))
+                    style.addImage("hazard", badge("⚠️", 0xFFF9A825.toInt()))
+                    style.addImage("crash", badge("💥", 0xFFD32F2F.toInt()))
+                    style.addSource(GeoJsonSource("hazards"))
+                    style.addLayer(
+                        SymbolLayer("hazards-layer", "hazards").withProperties(
+                            iconImage(Expression.get("type")),
+                            iconAllowOverlap(true),
+                            iconIgnorePlacement(true),
+                            iconSize(0.6f)
+                        )
+                    )
+
                     updateRouteOnMap(style)
+                    updateHazardsOnMap(style)
                     updateMapCamera(map)
                 }
             }
@@ -133,14 +160,16 @@ class OffTheGridSurfaceCallback(
         return bmp
     }
 
-    fun updateLocation(loc: Location) {
+    fun updateLocation(rawLoc: Location) {
+        val (loc, bearing) = getSnappedLocationAndBearing(rawLoc)
+
         mapView?.getMapAsync { map ->
             map.style?.let { style ->
                 val point = org.maplibre.geojson.Point.fromLngLat(loc.longitude, loc.latitude)
                 val feature = org.maplibre.geojson.Feature.fromGeometry(point).apply {
-                    addNumberProperty("bearing", if (loc.hasBearing()) loc.bearing.toDouble() else 0.0)
+                    addNumberProperty("bearing", bearing.toDouble())
                 }
-                style.getSourceAs<org.maplibre.android.style.sources.GeoJsonSource>("user-location")?.setGeoJson(feature)
+                style.getSourceAs<GeoJsonSource>("user-location")?.setGeoJson(feature)
             }
 
             val speedKmh = if (loc.hasSpeed()) loc.speed * 3.6f else 0f
@@ -149,14 +178,13 @@ class OffTheGridSurfaceCallback(
                 speedKmh > 40f -> 15.0
                 else -> 16.0
             }
-            val bearing = if (loc.hasBearing()) loc.bearing.toDouble() else map.cameraPosition.bearing
 
             map.easeCamera(
                 CameraUpdateFactory.newCameraPosition(
                     CameraPosition.Builder()
                         .target(LatLng(loc.latitude, loc.longitude))
                         .zoom(zoom)
-                        .bearing(bearing)
+                        .bearing(bearing.toDouble())
                         .build()
                 ),
                 600
@@ -172,12 +200,83 @@ class OffTheGridSurfaceCallback(
         }
     }
 
+    fun updateHazards(list: List<Hazard>) {
+        CarNavState.hazards = list
+        mapView?.getMapAsync { map ->
+            map.style?.let { style ->
+                updateHazardsOnMap(style)
+            }
+        }
+    }
+
+    private fun getSnappedLocationAndBearing(loc: Location): Pair<Location, Float> {
+        val r = CarNavState.route ?: return Pair(loc, if (loc.hasBearing()) loc.bearing else 0f)
+        if (r.points.size < 2) return Pair(loc, if (loc.hasBearing()) loc.bearing else 0f)
+
+        var minDist = Double.MAX_VALUE
+        var bestLat = loc.latitude
+        var bestLon = loc.longitude
+        var bestBearing = if (loc.hasBearing()) loc.bearing else 0f
+
+        val pts = r.points
+        for (i in 0 until pts.size - 1) {
+            val a = pts[i]
+            val b = pts[i + 1]
+            val proj = projectToSegment(loc.latitude, loc.longitude, a[1], a[0], b[1], b[0])
+            val dist = distM(loc.latitude, loc.longitude, proj.first, proj.second)
+            if (dist < minDist) {
+                minDist = dist
+                bestLat = proj.first
+                bestLon = proj.second
+                bestBearing = computeBearing(a[1], a[0], b[1], b[0])
+            }
+        }
+
+        if (minDist < 100.0) {
+            val snapped = Location(loc).apply {
+                latitude = bestLat
+                longitude = bestLon
+            }
+            return Pair(snapped, bestBearing)
+        }
+        return Pair(loc, if (loc.hasBearing()) loc.bearing else 0f)
+    }
+
+    private fun projectToSegment(pLat: Double, pLon: Double, aLat: Double, aLon: Double, bLat: Double, bLon: Double): Pair<Double, Double> {
+        val dx = bLon - aLon
+        val dy = bLat - aLat
+        if (dx == 0.0 && dy == 0.0) return Pair(aLat, aLon)
+        val t = max(0.0, min(1.0, ((pLon - aLon) * dx + (pLat - aLat) * dy) / (dx * dx + dy * dy)))
+        return Pair(aLat + t * dy, aLon + t * dx)
+    }
+
+    private fun computeBearing(aLat: Double, aLon: Double, bLat: Double, bLon: Double): Float {
+        val dLon = Math.toRadians(bLon - aLon)
+        val lat1 = Math.toRadians(aLat)
+        val lat2 = Math.toRadians(bLat)
+        val y = kotlin.math.sin(dLon) * kotlin.math.cos(lat2)
+        val x = kotlin.math.cos(lat1) * kotlin.math.sin(lat2) - kotlin.math.sin(lat1) * kotlin.math.cos(lat2) * kotlin.math.cos(dLon)
+        var brg = Math.toDegrees(kotlin.math.atan2(y, x)).toFloat()
+        if (brg < 0) brg += 360f
+        return brg
+    }
+
     private fun updateRouteOnMap(style: Style) {
         val r = CarNavState.route ?: return
         val coords = r.points.map { org.maplibre.geojson.Point.fromLngLat(it[0], it[1]) }
         val line = org.maplibre.geojson.LineString.fromLngLats(coords)
         val feature = org.maplibre.geojson.Feature.fromGeometry(line)
-        style.getSourceAs<org.maplibre.android.style.sources.GeoJsonSource>("route")?.setGeoJson(org.maplibre.geojson.FeatureCollection.fromFeatures(listOf(feature)))
+        style.getSourceAs<GeoJsonSource>("route")?.setGeoJson(org.maplibre.geojson.FeatureCollection.fromFeatures(listOf(feature)))
+    }
+
+    private fun updateHazardsOnMap(style: Style) {
+        val list = CarNavState.hazards
+        val features = list.map { h ->
+            org.maplibre.geojson.Feature.fromGeometry(org.maplibre.geojson.Point.fromLngLat(h.lon, h.lat)).apply {
+                addStringProperty("type", h.type)
+            }
+        }
+        style.getSourceAs<GeoJsonSource>("hazards")?.setGeoJson(org.maplibre.geojson.FeatureCollection.fromFeatures(features))
     }
 
     private fun updateMapCamera(map: org.maplibre.android.maps.MapLibreMap) {
@@ -190,7 +289,15 @@ class OffTheGridSurfaceCallback(
         }
     }
 
-    override fun onVisibleAreaChanged(visibleArea: Rect) {}
+    override fun onVisibleAreaChanged(visibleArea: Rect) {
+        // Pad map view to keep center focused in unobstructed area without shrinking the VirtualDisplay
+        val left = visibleArea.left
+        val top = visibleArea.top
+        mapView?.getMapAsync { map ->
+            map.setPadding(left, top, 0, 0)
+        }
+    }
+
     override fun onStableAreaChanged(stableArea: Rect) {}
 
     override fun onSurfaceDestroyed(surfaceContainer: SurfaceContainer) {

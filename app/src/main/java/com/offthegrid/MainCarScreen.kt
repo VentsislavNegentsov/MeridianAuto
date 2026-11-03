@@ -173,6 +173,7 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
 
         val carStep = CarStep.Builder(instruction(currentStep))
             .setManeuver(Maneuver.Builder(getManeuverType(currentStep)).build())
+            .setCue(instruction(currentStep))
             .build()
 
         val distance = Distance.create(distToNext, Distance.UNIT_METERS)
@@ -183,6 +184,7 @@ class MainCarScreen(carContext: CarContext, session: androidx.lifecycle.Lifecycl
         nextStep?.let { nStep ->
             val nextCarStep = CarStep.Builder(instruction(nStep))
                 .setManeuver(Maneuver.Builder(getManeuverType(nStep)).build())
+                .setCue(instruction(nStep))
                 .build()
             routingInfoBuilder.setNextStep(nextCarStep)
         }
